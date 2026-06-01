@@ -35,9 +35,12 @@
 #ifndef __SIM_EVENTQ_HH__
 #define __SIM_EVENTQ_HH__
 
+#include <cstdio>
+#include <pthread.h>
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstddef>
 #include <functional>
 #include <iosfwd>
 #include <list>
@@ -620,7 +623,11 @@ class EventQueue
     std::string objName;
     Event *head;
     Tick _curTick;
+    size_t queuedEvents = 0;
+    size_t maxQueuedEvents = 0;
+    size_t eventsServiced = 0;
 
+    Event *currEvent = nullptr;
     //! Mutex to protect async queue.
     UncontendedMutex async_queue_mutex;
 
@@ -813,6 +820,7 @@ class EventQueue
     void
     reschedule(Event *event, Tick when, bool always=false)
     {
+
         assert(when >= getCurTick());
         assert(always || event->scheduled());
         assert(event->initialized());
@@ -851,6 +859,10 @@ class EventQueue
     Event *getHead() const { return head; }
 
     Event *serviceOne();
+    // remove head event
+    Event *popNextEvent();
+    // does everything that serviceOne would do
+    Event *executePoppedEvent(Event *event);
 
     /**
      * process all events up to the given timestamp.  we inline a quick test
@@ -889,6 +901,7 @@ class EventQueue
      * @ingroup api_eventq
      */
     bool empty() const { return head == NULL; }
+    // size_t maxQueueSize() const { return maxQueuedEvents; }
 
     /**
      * This is a debugging function which will print everything on the event

@@ -44,12 +44,14 @@
 
 #include <atomic>
 #include <thread>
+#include <mutex>
 
 #include "base/logging.hh"
 #include "base/pollevent.hh"
 #include "base/trace.hh"
 #include "base/types.hh"
 #include "debug/EnteringEventQueue.hh"
+#include "debug/EventQueueLoop.hh"
 #include "sim/async.hh"
 #include "sim/eventq.hh"
 #include "sim/init_signals.hh"
@@ -169,6 +171,75 @@ class SimulatorThreads
 
 static std::unique_ptr<SimulatorThreads> simulatorThreads;
 
+struct multiThreads {
+	EventQueue* eventq;
+	std::mutex lock;
+    std::atomic<bool> stop{false};
+};
+
+static void simulationWorker(multiThreads *shared, int worker_id)
+{
+std::cout << "Worker thread " << worker_id << " running..." << std::endl;
+
+    // found in eventq.hh, sets the thread local pointer to the current event queue
+    // this is for single thread, when eventq is a parameter to the function
+    // curEventQueue(eventq);
+
+    curEventQueue(shared->eventq);
+    // memory order relaxed is
+    while (!shared->stop.load()) {
+	    Event *event = nullptr;
+
+       {
+            // take event queue lock
+            std::lock_guard <std::mutex> guard(shared->lock);
+	        // std::cout << "Work being done by" << worker_id << std::endl;
+            if (shared->eventq->empty()){
+                //  std::cout << "Worker thread " << worker_id
+                //          << " sees an empty event queue." << std::endl;
+                break;
+           }
+
+              // Optional full queue dump while debugging.
+              // shared->eventq->dump();
+
+            // this is WORKING simulate.cc line
+            // event = shared->eventq->serviceOne();
+
+            // thisis for split serviceone events (DOESNT WORK)
+            event = shared->eventq->popNextEvent();
+       } // queue lock is released
+
+        // testing with split serviceone events (DOESNT WORK)
+        Event *exit_event = shared->eventq->executePoppedEvent(event);
+        if (exit_event != nullptr) {
+            shared->stop.store(true);
+            break;
+        }
+        // this is WORKING simulate.cc line
+        // if (event != nullptr) {
+        //     shared->stop.store(true);
+        //     break;
+        // }
+
+        // this is for single thread when eventq is a parameter
+	    // while (!eventq->empty()){
+        // 	Event *event = eventq->serviceOne();
+        // 	if (event != NULL){
+        //     	   break;
+        // 	}
+	// }
+
+     std::cout << "Worker thread " << worker_id << " done." << std::endl;
+}
+
+// EventQueue *eventq is parameter for single thread
+//helper function to start the thread
+static std::thread startSimulationWorker(multiThreads *shared, int worker_id)
+{
+    return std::thread(simulationWorker, shared, worker_id);
+}
+
 struct DescheduleDeleter
 {
     void operator()(BaseGlobalEvent *event)
@@ -181,12 +252,14 @@ struct DescheduleDeleter
     }
 };
 
+static std::atomic<int> next_worker_id(1);
 /** Simulate for num_cycles additional cycles.  If num_cycles is -1
  * (the default), we simulate to MAX_TICKS unless the max ticks has been set
  * via the 'set_max_tick' function prior. This function is exported to Python.
  * @return The SimLoopExitEvent that caused the loop to exit.
  */
 GlobalSimLoopExitEvent *global_exit_event= nullptr;
+// actual simulate
 GlobalSimLoopExitEvent *
 simulate(Tick num_cycles)
 {
@@ -235,23 +308,49 @@ simulate(Tick num_cycles)
     }
 
     simulatorThreads->runUntilLocalExit();
-    Event *local_event = doSimLoop(mainEventQueue[0]);
-    assert(local_event);
 
+    // std::cout << "Main thread starting..." << std::endl;
+    // run worker thread
+    // for single thread
+    // int worker_id = next_worker_id.fetch_add(1);
+
+    // single thread line is:
+    // std::thread worker_thread = startSimulationWorker(getEventQueue(0), worker_id);
+
+    const int num_workers = 1;
+    multiThreads shared{getEventQueue(0), {}, false};
+
+    // dynamic array of thread objects, eventually push each worker to this
+    std::vector<std::thread> worker_threads;
+
+    // capacity for the number of workers
+    worker_threads.reserve(num_workers);
+    for (int i = 0; i < num_workers; i++){
+        int worker_id = next_worker_id.fetch_add(1);
+        // new element to end of vector, stores each thread
+        worker_threads.emplace_back(startSimulationWorker(&shared, worker_id));
+    }
+
+    // for each element in worker threads, call each thread t
+    for (std::thread &curr_thread : worker_threads) {
+        if (curr_thread.joinable()){
+            curr_thread.join();
+        }
+    }
+
+    // for original single thread
+    // std::thread worker_thread = startSimulationWorker(&shared, worker_id);
+    // worker_thread.join();
+
+    // std::cout << "Main thread done." << std::endl;
     // Restore normal ctrl-c operation as soon as the event queue is done
     restoreSigInt();
 
     inParallelMode = false;
 
-    // locate the global exit event and return it to Python
-    BaseGlobalEvent *global_event = local_event->globalEvent();
-    assert(global_event);
+    // deleted local, global, and global exit
 
-    global_exit_event =
-        dynamic_cast<GlobalSimLoopExitEvent *>(global_event);
-    assert(global_exit_event);
-
-    return global_exit_event;
+    return simulate_limit_event;
 }
 
 void set_max_tick(Tick tick)
@@ -335,8 +434,14 @@ doSimLoop(EventQueue *eventq)
                 processExternalSignal();
             }
         }
+        Event *nextEvent = eventq->getHead();
+        if (nextEvent) {
+            DPRINTF(EventQueueLoop, "Processing event: %s, scheduled for tick %d\n",
+                    nextEvent->name(), nextEvent->when());
+        }
 
         Event *exit_event = eventq->serviceOne();
+
         if (exit_event != NULL) {
             return exit_event;
         }
@@ -344,5 +449,6 @@ doSimLoop(EventQueue *eventq)
 
     // not reached... only exit is return on SimLoopExitEvent
 }
+
 
 } // namespace gem5

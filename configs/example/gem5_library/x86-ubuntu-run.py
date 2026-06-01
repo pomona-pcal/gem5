@@ -53,11 +53,13 @@ from gem5.simulate.simulator import Simulator
 
 board = X86DemoBoard()
 
+
 workload = obtain_resource(
     "x86-ubuntu-24.04-boot-with-systemd", resource_version="5.0.0"
 )
 board.set_workload(workload)
 
+# delete num_event_queues (added)
 simulator = Simulator(board=board)
 
 simulator.run()

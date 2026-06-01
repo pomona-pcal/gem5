@@ -78,6 +78,8 @@ Tick get_max_tick();
  */
 void terminateEventQueueThreads();
 
+
+
 extern GlobalSimLoopExitEvent *simulate_limit_event;
 
 } // namespace gem5

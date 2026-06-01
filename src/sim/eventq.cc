@@ -37,6 +37,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <iomanip>
+
+
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "cpu/smt.hh"
@@ -46,6 +49,22 @@ namespace gem5
 {
 
 Tick simQuantum = 0;
+
+// dictionary of mutexes per event
+// create a lock so that the dictionary itself is not used concurrently
+std::mutex mutexTableLock;
+std::unordered_map<std::string, std::mutex> eventLocksTable;
+
+std::mutex
+&getEventLock(const std::string &name)
+{
+    // unlock guard when done adding event to map
+    std::lock_guard<std::mutex> guard(mutexTableLock);
+
+    auto result = eventLocksTable.try_emplace(name);
+    return result.first->second;
+}
+
 
 //
 // Main Event Queues
@@ -137,24 +156,37 @@ Event::releaseImpl()
 void
 EventQueue::insert(Event *event)
 {
+    // add tick
+    // if (currEvent) {
+    //     std::cout << currEvent << "," << currEvent->name() << "," << event << "," << event->name() << "," << curTick() << "," << event->when() << "\n";
+    // }
+    // else {
+    //     std::cout << event << "," << event->name() << "," << curTick() << "," << event->when() << "\n";
+    // }
+
     // Deal with the head case
     if (!head || *event <= *head) {
         head = Event::insertBefore(event, head);
-        return;
+    } else {
+        // Figure out either which 'in bin' list we are on, or where a new list
+        // needs to be inserted
+        Event *prev = head;
+        Event *curr = head->nextBin;
+        while (curr && *curr < *event) {
+            prev = curr;
+            curr = curr->nextBin;
+        }
+
+        // Note: this operation may render all nextBin pointers on the
+        // prev 'in bin' list stale (except for the top one)
+        prev->nextBin = Event::insertBefore(event, curr);
     }
 
-    // Figure out either which 'in bin' list we are on, or where a new list
-    // needs to be inserted
-    Event *prev = head;
-    Event *curr = head->nextBin;
-    while (curr && *curr < *event) {
-        prev = curr;
-        curr = curr->nextBin;
-    }
-
-    // Note: this operation may render all nextBin pointers on the
-    // prev 'in bin' list stale (except for the top one)
-    prev->nextBin = Event::insertBefore(event, curr);
+    // ++queuedEvents;
+    // maxQueuedEvents = std::max(maxQueuedEvents, queuedEvents);
+    // if (maxQueuedEvents > 1 && curTick() > 0) {
+    //      panic("EventQueue exceeded size 1");
+    // }
 }
 
 Event *
@@ -200,30 +232,95 @@ EventQueue::remove(Event *event)
     // time as the head)
     if (*head == *event) {
         head = Event::removeItem(event, head);
-        return;
+    } else {
+        // Find the 'in bin' list that this event belongs on
+        Event *prev = head;
+        Event *curr = head->nextBin;
+        while (curr && *curr < *event) {
+            prev = curr;
+            curr = curr->nextBin;
+        }
+
+        if (!curr || *curr != *event)
+            panic("event not found!");
+
+        // curr points to the top item of the the correct 'in bin' list, when
+        // we remove an item, it returns the new top item (which may be
+        // unchanged)
+        prev->nextBin = Event::removeItem(event, curr);
     }
 
-    // Find the 'in bin' list that this event belongs on
-    Event *prev = head;
-    Event *curr = head->nextBin;
-    while (curr && *curr < *event) {
-        prev = curr;
-        curr = curr->nextBin;
+    // assert(queuedEvents > 0);
+    --queuedEvents;
+}
+
+Event *
+EventQueue::popNextEvent()
+{
+    if (head == NULL)
+        return nullptr;
+    --queuedEvents;
+
+    Event *event = head;
+    Event *next = head->nextInBin;
+    event->flags.clear(Event::Scheduled);
+
+
+    if (next) {
+        next->nextBin = head->nextBin;
+        head = next;
+    } else {
+        head = head->nextBin;
     }
 
-    if (!curr || *curr != *event)
-        panic("event not found!");
+    setCurTick(event->when());
 
-    // curr points to the top item of the the correct 'in bin' list, when
-    // we remove an item, it returns the new top item (which may be
-    // unchanged)
-    prev->nextBin = Event::removeItem(event, curr);
+    return event;
+}
+
+Event *
+EventQueue::executePoppedEvent(Event *event)
+{
+    if (!event){
+        return NULL;
+    }
+
+    if (!event->squashed()) {
+        // setCurTick(event->when());
+        if (debug::Event)
+            event->trace("executed");
+        currEvent = event;
+        std::mutex &eventLock = getEventLock(event->name());
+        std::lock_guard<std::mutex> eventGuard(eventLock);
+
+        event->process();
+        currEvent = nullptr;
+        if (event->isExitEvent()) {
+            assert(!event->flags.isSet(Event::Managed) ||
+                   !event->flags.isSet(Event::IsMainQueue)); // would be silly
+            return event;
+        }
+    } else {
+        event->flags.clear(Event::Squashed);
+    }
+
+    event->release();
+    return NULL;
 }
 
 Event *
 EventQueue::serviceOne()
 {
-    std::lock_guard<EventQueue> lock(*this);
+    // std::cout << "Current thread running is " << std::endl;
+    // std::lock_guard<EventQueue> lock(*this);
+    // assert(queuedEvents > 0);
+    --queuedEvents;
+
+    // ++eventsServiced;
+    // if (eventsServiced % 10 == 0) {
+       //  cprintf("tick=%llu,queue_size=%zu\n", curTick(), queuedEvents);
+    // }
+
     Event *event = head;
     Event *next = head->nextInBin;
     event->flags.clear(Event::Scheduled);
@@ -246,7 +343,14 @@ EventQueue::serviceOne()
         setCurTick(event->when());
         if (debug::Event)
             event->trace("executed");
+        currEvent = event;
+        // these two lines are purely for the locks per event
+        // get mutex for event and then lock it
+        std::mutex &eventLock = getEventLock(event->name());
+        std::lock_guard<std::mutex> eventGuard(eventLock);
+
         event->process();
+        currEvent = nullptr;
         if (event->isExitEvent()) {
             assert(!event->flags.isSet(Event::Managed) ||
                    !event->flags.isSet(Event::IsMainQueue)); // would be silly

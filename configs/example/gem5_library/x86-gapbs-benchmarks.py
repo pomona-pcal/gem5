@@ -64,7 +64,7 @@ from gem5.utils.requires import requires
 
 requires(
     coherence_protocol_required=CoherenceProtocol.MESI_TWO_LEVEL,
-    kvm_required=True,
+    # kvm_required=True,
 )
 
 parser = argparse.ArgumentParser(
@@ -113,7 +113,7 @@ memory = DualChannelDDR4_2400(size="3GiB")
 # we start with KVM cores to simulate the OS boot, then switch to the Timing
 # cores for the command we wish to run after boot.
 processor = SimpleSwitchableProcessor(
-    starting_core_type=CPUTypes.KVM,
+    starting_core_type=CPUTypes.ATOMIC,
     switch_core_type=CPUTypes.TIMING,
     isa=ISA.X86,
     num_cores=2,
